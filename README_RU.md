@@ -5,7 +5,7 @@
 [![Лицензия MIT](https://img.shields.io/badge/Лицензия-MIT-yellow.svg)](./LICENSE)
 [![Shell](https://img.shields.io/badge/Язык-Bash-blue.svg)](#)
 [![remnawave.sh](https://img.shields.io/badge/remnawave.sh-6.8.0-blue.svg)](#-remnawave-panel)
-[![remnanode.sh](https://img.shields.io/badge/remnanode.sh-4.6.2-blue.svg)](#-remnanode)
+[![remnanode.sh](https://img.shields.io/badge/remnanode.sh-4.6.3-blue.svg)](#-remnanode)
 [![Panel](https://img.shields.io/badge/Remnawave_Panel-3.4.x_ready-brightgreen.svg)](#)
 [![Локализация](https://img.shields.io/badge/🌐-RU_|_EN-green.svg)](./README.md)
 
@@ -57,7 +57,7 @@ sudo bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/remn
 | Скрипт | Версия | Что делает | Документация |
 |---|---|---|---|
 | 🚀 **remnawave.sh** | `6.8.0` | Панель: установка, Caddy, бэкапы, subscription-page | этот файл |
-| 🛰 **remnanode.sh** | `4.6.2` | Нода: Xray-core, логи, автоперезапуск | этот файл |
+| 🛰 **remnanode.sh** | `4.6.3` | Нода: Xray-core, логи, автоперезапуск | этот файл |
 | 🎭 **selfsteal.sh** | `2.11.1` | Caddy-маскировка для Reality, 11 шаблонов сайтов | [README-selfsteal](./README-selfsteal.md) |
 | 🌐 **wtm.sh** | `1.5.2` | WARP + Tor: WireGuard-outbound для Xray, WARP+ | [README-warp](./README-warp.md) |
 | 🐦 **netbird.sh** | `1.4.2` | NetBird mesh-VPN: CLI / cloud-init / Ansible | [README-netbird](./README-netbird.md) |
@@ -144,6 +144,10 @@ sudo bash <(curl -Ls https://cdn.jsdelivr.net/gh/DigneZzZ/remnawave-scripts@main
 - **Неинтерактивный режим** — `--force --secret-key="KEY"` для массового развёртывания
 - **NET_ADMIN** и миграции конфигурации добавляются автоматически при `update`
 - **Ротация логов** — 50 МБ × 5 файлов, без простоя; мультиарх: x86_64 / ARM64 / ARM32 / MIPS
+- **Поиск IP без зависаний** — адрес для `install` / `ports` / `help` / меню запрашивается у
+  нескольких провайдеров с таймаутами на запрос и на весь поиск, проверяется как IPv4/IPv6 и
+  подставляет последнее известное значение; команды без вывода адреса в сеть не ходят
+  (`NODE_IP=<ip>` полностью пропускает поиск)
 
 ```bash
 remnanode                 # интерактивное меню

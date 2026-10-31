@@ -9,7 +9,7 @@ bash tests/test-caddy-safety.sh    # one suite
 
 ## How they load the code under test
 
-Production code is read straight out of `remnawave.sh`; nothing is copied. The
+Production code is read straight out of the scripts; nothing is copied. The panel
 script marks the regions the tests need:
 
 ```bash
@@ -31,12 +31,17 @@ Blocks: `managed-files`, `caddyfile-template`, `caddy-safety`, `caddyfile-migrat
 | `test-managed-files.sh` | ownership marker, sha256 sidecar, backup rotation, the guarded-write decision table |
 | `test-caddy-safety.sh` | domain collection, catch-all opt-in, validate-before-reload, health check, automatic rollback, and the 11.09 incident replayed through `migrate_caddyfile` |
 | `test-no-unguarded-writes.sh` | structural scan: every write to a managed config path must be gated |
+| `test-public-ip.sh` | the RemnaNode public IP lookup: validator strictness, provider fallback, deadline, `NODE_IP=` preset, cache and interface fallbacks |
 | `test-remnanode-version.sh` | old package-based and new bundled node versions, menu/status output with built-in or external Xray, and missing metadata |
 
 The RemnaNode suite loads functions directly from `remnanode.sh`. It runs the real
 version parser in Node.js with fixture files and replaces only the Docker boundary;
 it does not start or modify containers. This suite needs Node.js on the test host
 and reports a skip when it is unavailable.
+
+`test-public-ip.sh` extracts the `# Public IP lookup` block from `remnanode.sh` and
+stubs `curl` and `ip` through a `PATH` shim, so it never touches the network and
+needs no root.
 
 `docker` and `curl` are stubbed through a `PATH` shim per sandbox, driven by
 `STUB_CADDY_RUNNING`, `STUB_VALIDATE_EXIT`, `STUB_RELOAD_EXIT`,

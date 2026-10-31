@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Version: 4.6.2
+# Version: 4.6.3
 set -e
-SCRIPT_VERSION="4.6.2"
+SCRIPT_VERSION="4.6.3"
 
 # Original invocation, captured before any shifting, so a self-update can
 # re-exec the new script with exactly the command the user typed.
@@ -293,13 +293,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Fetch IP address from ipinfo.io API
-NODE_IP=$(curl -s -4 ifconfig.io)
-
-# If the IPv4 retrieval is empty, attempt to retrieve the IPv6 address
-if [ -z "$NODE_IP" ]; then
-    NODE_IP=$(curl -s -6 ifconfig.io)
-fi
+# NODE_IP (the public address printed in the install summary, `ports`, `help`
+# and the interactive menu) is resolved on demand by ensure_node_ip(), which is
+# defined with the other helpers below. It used to be a bare
+# `curl -s -4 ifconfig.io` right here: no timeout, no validation, and it ran for
+# every command — see the public IP lookup block for the details.
 
 if [[ "$COMMAND" == "install" || "$COMMAND" == "install-script" ]] && [ -z "$APP_NAME" ]; then
     APP_NAME="remnanode"
@@ -374,6 +372,189 @@ colorized_echo() {
         "cyan") printf "\e[${style};96m${text}\e[0m\n" ;;
         *) echo "${text}" ;;
     esac
+}
+
+# ============================================
+# Public IP lookup
+#
+# NODE_IP is only ever printed (install summary, ports, help, interactive menu),
+# yet it used to be resolved by an unconditional two-liner at the top of the
+# script:
+#
+#     NODE_IP=$(curl -s -4 ifconfig.io)
+#     [ -z "$NODE_IP" ] && NODE_IP=$(curl -s -6 ifconfig.io)
+#
+# None of the failure modes was handled:
+#   * no --connect-timeout / --max-time, so a blackholed route or a filtered
+#     ifconfig.io stalled every command (update, logs, uninstall included) until
+#     curl gave up on its own — or forever;
+#   * curl exits non-zero when DNS or the connection fails and `set -e` killed
+#     the run right there, before anything was printed;
+#   * the body was never validated, so a rate-limit, Cloudflare or captive-portal
+#     page became the "IP address".
+#
+# The lookup is now lazy (only when an address is about to be printed), bounded
+# by PUBLIC_IP_DEADLINE seconds in total, tolerant of failures, validated as
+# IPv4/IPv6 and backed by a cache of the last good answer. A failed lookup never
+# aborts the command that only wanted to show an address.
+# ============================================
+NODE_IP="${NODE_IP:-}"          # pre-set by the caller → trusted, no lookup
+NODE_IP_ATTEMPTED="false"       # one attempt per run, never a retry storm
+NODE_IP_CACHE_FILE="$APP_DIR/.public-ip"
+
+PUBLIC_IP_CONNECT_TIMEOUT=3     # DNS + TCP + TLS per provider
+PUBLIC_IP_TOTAL_TIMEOUT=5       # hard per-request cap (--max-time)
+PUBLIC_IP_DEADLINE=10           # budget for the whole lookup, all providers
+
+PUBLIC_IP_SOURCES_V4=(
+    "https://ifconfig.io/ip"
+    "https://icanhazip.com"
+    "https://api.ipify.org"
+    "https://checkip.amazonaws.com"
+    "https://ipecho.net/plain"
+)
+PUBLIC_IP_SOURCES_V6=(
+    "https://ifconfig.io/ip"
+    "https://icanhazip.com"
+    "https://api6.ipify.org"
+    "https://ipv6.icanhazip.com"
+)
+
+# True when $1 is a dotted quad with every octet <= 255.
+is_ipv4_address() {
+    local octet
+    [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for octet in "${BASH_REMATCH[@]:1}"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+    return 0
+}
+
+# Deliberately permissive: enough to reject HTML/JSON error bodies, not a full
+# RFC 4291 validator (no zone ids, no IPv4-mapped form needed here).
+is_ipv6_address() {
+    [[ $1 =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]]
+}
+
+is_ip_address() {
+    is_ipv4_address "$1" || is_ipv6_address "$1"
+}
+
+# RFC1918 / loopback / link-local / CGNAT: values that cannot serve as the
+# panel-facing node address.
+is_private_ipv4() {
+    local a b
+    IFS=. read -r a b _ _ <<< "$1"
+    (( 10#$a == 0 || 10#$a == 10 || 10#$a == 127 )) && return 0
+    (( 10#$a == 169 && 10#$b == 254 )) && return 0
+    (( 10#$a == 172 && 10#$b >= 16 && 10#$b <= 31 )) && return 0
+    (( 10#$a == 192 && 10#$b == 168 )) && return 0
+    (( 10#$a == 100 && 10#$b >= 64 && 10#$b <= 127 )) && return 0
+    return 1
+}
+
+# A broken IPv6 stack is worse than no IPv6: every provider would burn a connect
+# timeout. Only try v6 when the kernel actually has a v6 route.
+ipv6_available() {
+    command -v ip >/dev/null 2>&1 || return 0   # `ip` missing: let curl decide
+    ip -6 route get 2001:4860:4860::8888 >/dev/null 2>&1
+}
+
+# Ask the "what is my IP" providers in order and take the first reply that parses
+# as an address. Each request is capped by --max-time, the whole loop by
+# PUBLIC_IP_DEADLINE, so a dead network costs at most that once per run.
+detect_public_ip() {
+    command -v curl >/dev/null 2>&1 || return 1
+
+    local started=$SECONDS family source answer remaining request_timeout
+    local -a sources
+
+    for family in -4 -6; do
+        if [ "$family" = "-6" ] && ! ipv6_available; then
+            continue
+        fi
+        if [ "$family" = "-4" ]; then
+            sources=("${PUBLIC_IP_SOURCES_V4[@]}")
+        else
+            sources=("${PUBLIC_IP_SOURCES_V6[@]}")
+        fi
+        for source in "${sources[@]}"; do
+            remaining=$(( PUBLIC_IP_DEADLINE - (SECONDS - started) ))
+            if (( remaining <= 0 )); then
+                return 1
+            fi
+            request_timeout=$PUBLIC_IP_TOTAL_TIMEOUT
+            (( request_timeout > remaining )) && request_timeout=$remaining
+            answer=$(curl -fsS "$family" \
+                --connect-timeout "$PUBLIC_IP_CONNECT_TIMEOUT" \
+                --max-time "$request_timeout" \
+                "$source" 2>/dev/null) || continue
+            answer="${answer%%$'\n'*}"          # first line only
+            answer="${answer//[[:space:]]/}"    # and no stray CR/LF/spaces
+            if is_ip_address "$answer"; then
+                printf '%s\n' "$answer"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# Last resort, no network involved: the source address the kernel would use for
+# outbound traffic. Only trusted when it is globally routable — on a NAT'd host
+# this is a 10.x/192.168.x address and printing it would be useless.
+detect_interface_ip() {
+    command -v ip >/dev/null 2>&1 || return 1
+    local answer
+    answer=$(ip -4 route get 1.1.1.1 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }') || return 1
+    is_ipv4_address "$answer" || return 1
+    is_private_ipv4 "$answer" && return 1
+    printf '%s\n' "$answer"
+}
+
+read_node_ip_cache() {
+    local cached
+    [ -r "$NODE_IP_CACHE_FILE" ] || return 1
+    cached=$(head -n 1 "$NODE_IP_CACHE_FILE" 2>/dev/null) || return 1
+    cached="${cached//[[:space:]]/}"
+    is_ip_address "$cached" || return 1
+    printf '%s\n' "$cached"
+}
+
+# Best effort: also runs unprivileged, so a failed write is ignored.
+write_node_ip_cache() {
+    is_ip_address "$1" || return 0
+    printf '%s\n' "$1" 2>/dev/null >"$NODE_IP_CACHE_FILE" || true
+}
+
+# Resolve NODE_IP at most once per run. Always returns 0: a failed lookup must
+# never abort a command that only wanted to print an address.
+ensure_node_ip() {
+    if [ -n "$NODE_IP" ] || [ "$NODE_IP_ATTEMPTED" = "true" ]; then
+        return 0
+    fi
+    NODE_IP_ATTEMPTED="true"
+
+    local answer
+    if answer=$(detect_public_ip); then
+        NODE_IP="$answer"
+        write_node_ip_cache "$NODE_IP"
+        return 0
+    fi
+    if answer=$(read_node_ip_cache); then
+        NODE_IP="$answer"
+        colorized_echo yellow "⚠️  Public IP lookup failed — using the last known address $NODE_IP."
+        return 0
+    fi
+    if answer=$(detect_interface_ip); then
+        NODE_IP="$answer"
+        colorized_echo yellow "⚠️  Public IP lookup failed — using local address $NODE_IP (may be behind NAT)."
+        return 0
+    fi
+    colorized_echo yellow "⚠️  Public IP lookup failed: no provider answered within ${PUBLIC_IP_DEADLINE}s."
+    colorized_echo gray "   Find it with 'ip -4 addr', or rerun with NODE_IP=<your-ip> to skip the lookup."
+    return 0
 }
 
 check_running_as_root() {
@@ -1842,9 +2023,12 @@ install_command() {
     echo
     
     echo -e "\033[1;37m🌐 Connection Information:\033[0m"
-    printf "   \033[38;5;15m%-12s\033[0m \033[38;5;250m%s\033[0m\n" "IP Address:" "$NODE_IP"
+    [ -n "$NODE_IP" ] || colorized_echo gray "   Looking up the public IP address..."
+    [ -n "$NODE_IP" ] || ensure_node_ip
+    local shown_ip="${NODE_IP:-unknown}"
+    printf "   \033[38;5;15m%-12s\033[0m \033[38;5;250m%s\033[0m\n" "IP Address:" "$shown_ip"
     printf "   \033[38;5;15m%-12s\033[0m \033[38;5;250m%s\033[0m\n" "Port:" "$NODE_PORT"
-    printf "   \033[38;5;15m%-12s\033[0m \033[38;5;250m%s:%s\033[0m\n" "Full URL:" "$NODE_IP" "$NODE_PORT"
+    printf "   \033[38;5;15m%-12s\033[0m \033[38;5;250m%s:%s\033[0m\n" "Full URL:" "$shown_ip" "$NODE_PORT"
     echo
     
     echo -e "\033[1;37m📋 Next Steps:\033[0m"
@@ -4285,9 +4469,10 @@ ports_command() {
     printf "   \033[38;5;244m%-22s\033[0m \033[38;5;250m%s\033[0m\n" "Internal REST:" "/run/remnawave-internal.sock"
     
     # Show connection info
+    [ -n "$NODE_IP" ] || ensure_node_ip
     echo
     echo -e "\033[1;37m📋 Connection Info:\033[0m"
-    printf "   \033[38;5;15m%-22s\033[0m \033[38;5;117m%s:%s\033[0m\n" "Node Address:" "$NODE_IP" "${node_port:-3000}"
+    printf "   \033[38;5;15m%-22s\033[0m \033[38;5;117m%s:%s\033[0m\n" "Node Address:" "${NODE_IP:-unknown}" "${node_port:-3000}"
     
     echo
     echo -e "\033[38;5;8m$(printf '─%.0s' $(seq 1 50))\033[0m"
@@ -4650,7 +4835,8 @@ usage() {
         fi
         if [ -n "$node_port" ]; then
             echo -e "\033[38;5;8m$(printf '─%.0s' $(seq 1 55))\033[0m"
-            echo -e "\033[1;37m🌐 Node Access:\033[0m \033[38;5;117m$NODE_IP:$node_port\033[0m"
+            [ -n "$NODE_IP" ] || ensure_node_ip
+            echo -e "\033[1;37m🌐 Node Access:\033[0m \033[38;5;117m${NODE_IP:-unknown}:$node_port\033[0m"
         fi
     fi
 
@@ -4816,11 +5002,12 @@ main_menu() {
                 
                 # Показываем информацию о подключении
                 if [ -n "$node_port" ]; then
+                    [ -n "$NODE_IP" ] || ensure_node_ip
                     echo
                     echo -e "\033[1;37m🌐 Connection Information:\033[0m"
-                    printf "   \033[38;5;15m%-12s\033[0m \033[38;5;117m%s\033[0m\n" "IP Address:" "$NODE_IP"
+                    printf "   \033[38;5;15m%-12s\033[0m \033[38;5;117m%s\033[0m\n" "IP Address:" "${NODE_IP:-unknown}"
                     printf "   \033[38;5;15m%-12s\033[0m \033[38;5;117m%s\033[0m\n" "Port:" "$node_port"
-                    printf "   \033[38;5;15m%-12s\033[0m \033[38;5;117m%s:%s\033[0m\n" "Full URL:" "$NODE_IP" "$node_port"
+                    printf "   \033[38;5;15m%-12s\033[0m \033[38;5;117m%s:%s\033[0m\n" "Full URL:" "${NODE_IP:-unknown}" "$node_port"
                 fi
                 
                 # Проверяем Xray-core и версию RemnaNode
